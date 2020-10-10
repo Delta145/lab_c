@@ -4,10 +4,9 @@
 #include <semaphore.h>
 #include <sys/mman.h>
 
-#define log_level 1
+#define log_level 2
 #define megabyte_size 1024*1024
 #define A 50
-#define B 0xDEADBEEF
 #define D 30
 #define E 11
 #define G 24
@@ -34,10 +33,30 @@ typedef struct {
     sem_t *semaphores;
 } thread_reader_data;
 
+
 int read_int_from_file(FILE *file) {
     int i = 0;
     fread(&i, 4, 1, file);
     return i;
+}
+
+char* seq_read(FILE* file_ptr) {
+    fseek(file_ptr, 0, SEEK_END);
+    long file_size = ftell(file_ptr);
+    rewind(file_ptr);
+    char *buffer = (char*) malloc(file_size);
+    int blocks = file_size / G;
+    int last_block_size = file_size % G;
+    char* buf_ptr;
+    for (int i = 0; i < blocks; ++i) {
+        buf_ptr = buffer + G*i;
+        fread(buf_ptr, G, 1, file_ptr);
+    }
+    if (last_block_size > 0) {
+        buf_ptr = buffer + G*blocks;
+        fread(buf_ptr, last_block_size, 1, file_ptr);
+    }
+    return buffer;
 }
 
 void *fill_with_random(void *thread_data) {
@@ -49,6 +68,9 @@ void *fill_with_random(void *thread_data) {
         for (int i = 0; i < data->ints_per_thread; i++) {
             data->start[i] = read_int_from_file(data->file);
         }
+    }
+    if (log_level > 1) {
+        printf("[GENERATOR-%d] finished...\n", data->thread_number);
     }
     return NULL;
 }
@@ -75,26 +97,17 @@ void *read_files(void *thread_data) {
         fseek(file_ptr, 0, SEEK_END);
         long file_size = ftell(file_ptr);
         rewind(file_ptr);
-        int *buffer = (int *) malloc(file_size);
-        unsigned long result = fread(buffer, 1, file_size, file_ptr);
+        char *buffer = seq_read(file_ptr);
         fclose(file_ptr);
         sem_post(&data->semaphores[data->file_number]);
-
-        if (result != file_size) {
-            fputs("Ошибка чтения", stderr);
-            exit(-1);
-        }
-        long avg = 0;
+        int *int_buf = (int *) buffer;
+        long sum = 0;
         for (int i = 0; i < file_size / 4; i++) {
-            avg += buffer[i];
-//        if (buffer[i] < avg) {
-//            avg = buffer[i];
-//        }
+            sum += int_buf[i];
         }
-        avg = avg / (file_size / 4);
 
         if (log_level > 0) {
-            printf("[READER-%d] file %s avg is %ld.\n", data->thread_number, filename, avg);
+            printf("[READER-%d] file %s sum is %ld.\n", data->thread_number, filename, sum);
         }
 
         free(buffer);
@@ -102,16 +115,17 @@ void *read_files(void *thread_data) {
     return NULL;
 }
 
-void write_block(void *ptr, int size, int n, FILE *s) {
+void seq_write(void *ptr, int size, int n, FILE *s) {
     int bytes = size * n;
     int blocks = bytes / G;
     int last_block_size = bytes % G;
     for (int i = 0; i < blocks; ++i) {
-        fwrite(ptr, G, 1, s);
-        ptr += G;
+        char* buf_ptr = ptr + G*i;
+        fwrite(buf_ptr, G, 1, s);
     }
     if (last_block_size > 0) {
-        fwrite(ptr, last_block_size, 1, s);
+        char* buf_ptr = ptr + G*blocks;
+        fwrite(buf_ptr, last_block_size, 1, s);
     }
 }
 
@@ -128,14 +142,12 @@ void *write_to_files(void *thread_data) {
             int is_done = 0;
             while (!is_done) {
                 if (ints_to_file + write_pointer < data->end) {
-//                    fwrite(write_pointer, sizeof(int), ints_to_file, current_file);
-                    write_block(write_pointer, sizeof(int), ints_to_file, current_file);
+                    seq_write(write_pointer, sizeof(int), ints_to_file, current_file);
                     write_pointer += ints_to_file;
                     is_done = 1;
                 } else {
                     int available = data->end - write_pointer;
-//                    fwrite(write_pointer, sizeof(int), available, current_file);
-                    write_block(write_pointer, sizeof(int), available, current_file);
+                    seq_write(write_pointer, sizeof(int), available, current_file);
                     write_pointer = data->start;
                     ints_to_file -= available;
                 }
@@ -151,8 +163,7 @@ int main() {
     const char *devurandom_filename = "/dev/urandom";
     FILE *devurandom_file = fopen(devurandom_filename, "r");
 
-//    int *memory_region = (int *) malloc(A * megabyte_size);
-    int *memory_region = mmap(B, A * megabyte_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int *memory_region = malloc(A * megabyte_size);
     int *thread_data_start = memory_region;
 
     // generator threads start
@@ -215,9 +226,9 @@ int main() {
     for (int i = 0; i < D; ++i) {
         pthread_create(&(generator_threads[i]), NULL, fill_with_random, &generator_data[i]);
     }
-//    for (int i = 0; i < I; i++) {
+    for (int i = 0; i < I; i++) {
 //        pthread_join(generator_threads[i], NULL);
-//    }
+    }
 
     pthread_create(thread_writer, NULL, write_to_files, writer_data);
 //    pthread_join(*thread_writer, NULL);
@@ -229,7 +240,6 @@ int main() {
         pthread_join(reader_threads[i], NULL);
     }
 
-
     for (int i = 0; i < files; ++i) {
         sem_destroy(&semaphore[i]);
     }
@@ -238,7 +248,10 @@ int main() {
 
     free(generator_threads);
     free(generator_data);
-//    free(memory_region);
-    munmap(memory_region, A * megabyte_size);
+    free(thread_writer);
+    free(writer_data);
+    free(reader_threads);
+    free(reader_data);
+    free(memory_region);
     return 0;
 }
