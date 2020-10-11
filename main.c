@@ -1,16 +1,26 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <semaphore.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <linux/futex.h>
+#include <syscall.h>
+#include <asm/errno.h>
+#include <errno.h>
 
-#define log_level 2
+#define log_level 0
 #define megabyte_size 1024*1024
-#define A 50
-#define D 30
-#define E 11
-#define G 24
-#define I 20
+#define A 120
+#define D 73
+#define E 150
+#define G 136
+#define I 147
+#define observe_block 1
 
 typedef struct {
     int thread_number;
@@ -24,14 +34,68 @@ typedef struct {
     int files;
     int *start;
     int *end;
-    sem_t *semaphores;
+    int *futexes;
 } thread_writer_data;
 
 typedef struct {
     int thread_number;
     int file_number;
-    sem_t *semaphores;
+    int *futexes;
 } thread_reader_data;
+
+static int
+futex(int *uaddr, int futex_op, int val,
+      const struct timespec *timeout, int *uaddr2, int val3)
+{
+    return syscall(SYS_futex, uaddr, futex_op, val,
+                   timeout, uaddr2, val3);
+}
+
+/* Acquire the futex pointed to by 'futexp': wait for its value to
+          become 1, and then set the value to 0. */
+static void
+fwait(int *futexp)
+{
+    int s;
+
+    /* atomic_compare_exchange_strong(ptr, oldval, newval)
+       atomically performs the equivalent of:
+
+           if (*ptr == *oldval)
+               *ptr = newval;
+
+       It returns true if the test yielded true and *ptr was updated. */
+
+    while (1) {
+
+        /* Is the futex available? */
+        const int one = 1;
+        if (atomic_compare_exchange_strong(futexp, &one, 0))
+            break;      /* Yes */
+
+        /* Futex is not available; wait */
+
+        s = futex(futexp, FUTEX_WAIT, 0, NULL, NULL, 0);
+        if (s == -1 && errno != EAGAIN)
+            printf("futex-FUTEX_WAIT");
+    }
+}
+
+static void
+fpost(int *futexp)
+{
+    int s;
+
+    /* atomic_compare_exchange_strong() was described in comments above */
+
+    const int zero = 0;
+    if (atomic_compare_exchange_strong(futexp, &zero, 1)) {
+        s = futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
+        if (s  == -1)
+            printf("futex-FUTEX_WAKE");
+    }
+}
+
 
 
 int read_int_from_file(FILE *file) {
@@ -85,10 +149,19 @@ void *read_files(void *thread_data) {
         filename[5] = '0' + data->file_number;
         FILE *file_ptr = NULL;
         while (file_ptr == NULL) {
-            sem_wait(&data->semaphores[data->file_number]);
+            if (observe_block) {
+                printf("[READER-%d] wait for mutex %d...\n", data->thread_number, data->file_number);
+            }
+            fwait(&data->futexes[data->file_number]);
+            if (observe_block) {
+                printf("[READER-%d] captured mutex %d!\n", data->thread_number, data->file_number);
+            }
             file_ptr = fopen(filename, "rb");
             if (file_ptr == NULL) {
-                sem_post(&data->semaphores[data->file_number]);
+                fpost(&data->futexes[data->file_number]);
+                if (observe_block) {
+                    printf("[READER-%d] free mutex %d!\n", data->thread_number, data->file_number);
+                }
                 if (log_level > 2) {
                     printf("[READER-%d] I/O error on open file %s.\n", data->thread_number, filename);
                 }
@@ -99,7 +172,10 @@ void *read_files(void *thread_data) {
         rewind(file_ptr);
         char *buffer = seq_read(file_ptr);
         fclose(file_ptr);
-        sem_post(&data->semaphores[data->file_number]);
+        fpost(&data->futexes[data->file_number]);
+        if (observe_block) {
+            printf("[READER-%d] free mutex %d!\n", data->thread_number, data->file_number);
+        }
         int *int_buf = (int *) buffer;
         long sum = 0;
         for (int i = 0; i < file_size / 4; i++) {
@@ -115,45 +191,79 @@ void *read_files(void *thread_data) {
     return NULL;
 }
 
-void seq_write(void *ptr, int size, int n, FILE *s) {
+void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
+    struct stat fstat;
+    stat(filepath, &fstat);
+    int blksize = (int)fstat.st_blksize;
+    int align = blksize-1;
     int bytes = size * n;
-    int blocks = bytes / G;
-    int last_block_size = bytes % G;
+    // impossible to use G from the task because O_DIRECT flag requires aligned both the memory address and your buffer to the filesystem's block size
+    int blocks = bytes / blksize;
+
+    char *buff = (char *) malloc((int)blksize+align);
+    // code from stackoverflow... wtf???
+    char *wbuff = (char *)(((uintptr_t)buff+align)&~((uintptr_t)align));
+
     for (int i = 0; i < blocks; ++i) {
-        char* buf_ptr = ptr + G*i;
-        fwrite(buf_ptr, G, 1, s);
+        char* buf_ptr = ptr + blksize*i;
+        // copy from memory to write buffer
+        for (int j = 0; j < blksize; j++) {
+            buff[j] = buf_ptr[j];
+        }
+        if (pwrite(fd, wbuff, blksize, blksize*i) < 0) {
+            free((char *)buff);
+            printf("write error occurred\n");
+            return;
+        }
     }
-    if (last_block_size > 0) {
-        char* buf_ptr = ptr + G*blocks;
-        fwrite(buf_ptr, last_block_size, 1, s);
-    }
+    free((char *)buff);
 }
 
 void *write_to_files(void *thread_data) {
     thread_writer_data *data = (thread_writer_data *) thread_data;
     int *write_pointer = data->start;
+    if (log_level > 1) {
+        printf("[WRITER] started...\n");
+    }
     while (1) {
         for (int i = 0; i < data->files; i++) {
             char filename[6] = "lab1_0";
             filename[5] = '0' + i;
-            sem_wait(&data->semaphores[i]);
-            FILE *current_file = fopen(filename, "wb");
+            if (observe_block) {
+                printf("[WRITER] waiting for mutex %d...\n", i);
+            }
+            fwait(&data->futexes[i]);
+            if (observe_block) {
+                printf("[WRITER] captured mutex %d\n", i);
+            }
+            // NOCACHE file write
+            int current_file = open(filename, O_WRONLY | O_CREAT | __O_DIRECT, 00666);
+            if (current_file == - 1) {
+                printf("error on open file for write\n");
+                fpost(&data->futexes[i]);
+                return NULL;
+            }
             int ints_to_file = data->ints_per_file;
             int is_done = 0;
+            printf("[WRITER] write started\n");
             while (!is_done) {
                 if (ints_to_file + write_pointer < data->end) {
-                    seq_write(write_pointer, sizeof(int), ints_to_file, current_file);
+                    seq_write(write_pointer, sizeof(int), ints_to_file, current_file, filename);
                     write_pointer += ints_to_file;
                     is_done = 1;
                 } else {
                     int available = data->end - write_pointer;
-                    seq_write(write_pointer, sizeof(int), available, current_file);
+                    seq_write(write_pointer, sizeof(int), available, current_file, filename);
                     write_pointer = data->start;
                     ints_to_file -= available;
                 }
             }
-            fclose(current_file);
-            sem_post(&data->semaphores[i]);
+            close(current_file);
+            printf("[WRITER] write finished\n");
+            fpost(&data->futexes[i]);
+            if (observe_block) {
+                printf("[WRITER] free mutex %d\n", i);
+            }
         }
     }
     return NULL;
@@ -191,9 +301,9 @@ int main() {
         files++;
     }
 
-    sem_t semaphore[files];
+    int *futexes = malloc(sizeof(int) * files);
     for (int i = 0; i < files; ++i) {
-        sem_init(&semaphore[i], 0, 1);
+        futexes[i] = 1;
     }
 
     thread_writer_data *writer_data = (thread_writer_data *) malloc(sizeof(thread_writer_data));
@@ -202,7 +312,7 @@ int main() {
     writer_data->files = files;
     writer_data->start = memory_region;
     writer_data->end = memory_region + ints;
-    writer_data->semaphores = semaphore;
+    writer_data->futexes = futexes;
 
     // writer thread end
 
@@ -217,7 +327,7 @@ int main() {
         }
         reader_data[i].thread_number = i;
         reader_data[i].file_number = file_number;
-        reader_data[i].semaphores = semaphore;
+        reader_data[i].futexes = futexes;
         file_number++;
     }
 
@@ -240,9 +350,7 @@ int main() {
         pthread_join(reader_threads[i], NULL);
     }
 
-    for (int i = 0; i < files; ++i) {
-        sem_destroy(&semaphore[i]);
-    }
+    free(futexes);
 
     fclose(devurandom_file);
 
