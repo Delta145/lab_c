@@ -13,14 +13,18 @@
 #include <asm/errno.h>
 #include <errno.h>
 
-#define log_level 0
+#define print_thread_activity 0
 #define megabyte_size 1024*1024
 #define A 120
 #define D 73
 #define E 150
 #define G 136
 #define I 147
-#define observe_block 1
+#define observe_block 0
+#define print_sum 1
+#define infinity_loop 1
+
+int break_loop = 0;
 
 typedef struct {
     int thread_number;
@@ -86,8 +90,6 @@ fpost(int *futexp)
 {
     int s;
 
-    /* atomic_compare_exchange_strong() was described in comments above */
-
     const int zero = 0;
     if (atomic_compare_exchange_strong(futexp, &zero, 1)) {
         s = futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
@@ -96,7 +98,7 @@ fpost(int *futexp)
     }
 }
 
-
+int generators_filled = 0;
 
 int read_int_from_file(FILE *file) {
     int i = 0;
@@ -104,36 +106,44 @@ int read_int_from_file(FILE *file) {
     return i;
 }
 
-char* seq_read(FILE* file_ptr) {
-    fseek(file_ptr, 0, SEEK_END);
-    long file_size = ftell(file_ptr);
-    rewind(file_ptr);
+char* seq_read(int fd, int file_size) {
     char *buffer = (char*) malloc(file_size);
     int blocks = file_size / G;
     int last_block_size = file_size % G;
     char* buf_ptr;
     for (int i = 0; i < blocks; ++i) {
         buf_ptr = buffer + G*i;
-        fread(buf_ptr, G, 1, file_ptr);
+        pread(fd, buf_ptr, G, G*i);
     }
     if (last_block_size > 0) {
         buf_ptr = buffer + G*blocks;
-        fread(buf_ptr, last_block_size, 1, file_ptr);
+        pread(fd, buf_ptr, last_block_size, G*blocks);
     }
     return buffer;
 }
 
 void *fill_with_random(void *thread_data) {
     thread_generator_data *data = (thread_generator_data *) thread_data;
-    if (log_level > 1) {
+    if (print_thread_activity) {
         printf("[GENERATOR-%d] started...\n", data->thread_number);
     }
-    while (1) {
+    int first_run = 1;
+    do {
         for (int i = 0; i < data->ints_per_thread; i++) {
             data->start[i] = read_int_from_file(data->file);
         }
-    }
-    if (log_level > 1) {
+        if (first_run) {
+            atomic_fetch_add(&generators_filled, 1);
+            first_run = 0;
+            if (generators_filled == D) {
+                printf("После заполнения данными\n");
+            }
+        }
+        if (break_loop) {
+            break;
+        }
+    } while (infinity_loop);
+    if (print_thread_activity) {
         printf("[GENERATOR-%d] finished...\n", data->thread_number);
     }
     return NULL;
@@ -141,14 +151,14 @@ void *fill_with_random(void *thread_data) {
 
 void *read_files(void *thread_data) {
     thread_reader_data *data = (thread_reader_data *) thread_data;
-    if (log_level > 1) {
+    if (print_thread_activity) {
         printf("[READER-%d] started...\n", data->thread_number);
     }
-    while (1) {
+    do {
         char filename[6] = "lab1_0";
         filename[5] = '0' + data->file_number;
-        FILE *file_ptr = NULL;
-        while (file_ptr == NULL) {
+        int file_desc = -1;
+        while (file_desc == -1) {
             if (observe_block) {
                 printf("[READER-%d] wait for mutex %d...\n", data->thread_number, data->file_number);
             }
@@ -156,22 +166,23 @@ void *read_files(void *thread_data) {
             if (observe_block) {
                 printf("[READER-%d] captured mutex %d!\n", data->thread_number, data->file_number);
             }
-            file_ptr = fopen(filename, "rb");
-            if (file_ptr == NULL) {
+            file_desc = open(filename, O_RDONLY, 00666);
+            if (file_desc == -1) {
                 fpost(&data->futexes[data->file_number]);
                 if (observe_block) {
                     printf("[READER-%d] free mutex %d!\n", data->thread_number, data->file_number);
                 }
-                if (log_level > 2) {
+                if (print_thread_activity) {
                     printf("[READER-%d] I/O error on open file %s.\n", data->thread_number, filename);
                 }
             }
         }
-        fseek(file_ptr, 0, SEEK_END);
-        long file_size = ftell(file_ptr);
-        rewind(file_ptr);
-        char *buffer = seq_read(file_ptr);
-        fclose(file_ptr);
+        struct stat st;
+        stat(filename, &st);
+        int file_size = st.st_size;
+
+        char *buffer = seq_read(file_desc, file_size);
+        close(file_desc);
         fpost(&data->futexes[data->file_number]);
         if (observe_block) {
             printf("[READER-%d] free mutex %d!\n", data->thread_number, data->file_number);
@@ -182,19 +193,22 @@ void *read_files(void *thread_data) {
             sum += int_buf[i];
         }
 
-        if (log_level > 0) {
+        if (print_sum) {
             printf("[READER-%d] file %s sum is %ld.\n", data->thread_number, filename, sum);
         }
 
         free(buffer);
-    }
+        if (break_loop) {
+            break;
+        }
+    } while (infinity_loop);
     return NULL;
 }
 
 void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
     struct stat fstat;
     stat(filepath, &fstat);
-    int blksize = (int)fstat.st_blksize;
+    int blksize = (int) fstat.st_blksize;
     int align = blksize-1;
     int bytes = size * n;
     // impossible to use G from the task because O_DIRECT flag requires aligned both the memory address and your buffer to the filesystem's block size
@@ -222,10 +236,10 @@ void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
 void *write_to_files(void *thread_data) {
     thread_writer_data *data = (thread_writer_data *) thread_data;
     int *write_pointer = data->start;
-    if (log_level > 1) {
+    if (print_thread_activity) {
         printf("[WRITER] started...\n");
     }
-    while (1) {
+    do {
         for (int i = 0; i < data->files; i++) {
             char filename[6] = "lab1_0";
             filename[5] = '0' + i;
@@ -245,7 +259,9 @@ void *write_to_files(void *thread_data) {
             }
             int ints_to_file = data->ints_per_file;
             int is_done = 0;
-            printf("[WRITER] write started\n");
+            if (print_thread_activity) {
+                printf("[WRITER] write started\n");
+            }
             while (!is_done) {
                 if (ints_to_file + write_pointer < data->end) {
                     seq_write(write_pointer, sizeof(int), ints_to_file, current_file, filename);
@@ -259,13 +275,18 @@ void *write_to_files(void *thread_data) {
                 }
             }
             close(current_file);
-            printf("[WRITER] write finished\n");
+            if (print_thread_activity) {
+                printf("[WRITER] write finished\n");
+            }
             fpost(&data->futexes[i]);
             if (observe_block) {
                 printf("[WRITER] free mutex %d\n", i);
             }
         }
-    }
+        if (break_loop) {
+            break;
+        }
+    } while (infinity_loop);
     return NULL;
 }
 
@@ -273,6 +294,8 @@ int main() {
     const char *devurandom_filename = "/dev/urandom";
     FILE *devurandom_file = fopen(devurandom_filename, "r");
 
+    printf("До аллокации (продолжить - [ENTER])");
+    getchar();
     int *memory_region = malloc(A * megabyte_size);
     int *thread_data_start = memory_region;
 
@@ -280,6 +303,8 @@ int main() {
 
     pthread_t *generator_threads = (pthread_t *) malloc(D * sizeof(pthread_t));
     thread_generator_data *generator_data = (thread_generator_data *) malloc(D * sizeof(thread_generator_data));
+    printf("После аллокации (продолжить - [ENTER])");
+    getchar();
 
     int ints = A * 1024 * 256;
     int ints_per_thread = ints / D;
@@ -336,18 +361,21 @@ int main() {
     for (int i = 0; i < D; ++i) {
         pthread_create(&(generator_threads[i]), NULL, fill_with_random, &generator_data[i]);
     }
-    for (int i = 0; i < I; i++) {
-//        pthread_join(generator_threads[i], NULL);
-    }
 
     pthread_create(thread_writer, NULL, write_to_files, writer_data);
-//    pthread_join(*thread_writer, NULL);
 
     for (int i = 0; i < I; ++i) {
         pthread_create(&(reader_threads[i]), NULL, read_files, &reader_data[i]);
     }
+    printf("Для останвки беск. цикла нажмите [ENTER]\n");
+    getchar();
+    break_loop = 1;
     for (int i = 0; i < I; i++) {
         pthread_join(reader_threads[i], NULL);
+    }
+    pthread_join(*thread_writer, NULL);
+    for (int i = 0; i < D; i++) {
+        pthread_join(generator_threads[i], NULL);
     }
 
     free(futexes);
@@ -361,5 +389,7 @@ int main() {
     free(reader_threads);
     free(reader_data);
     free(memory_region);
+    printf("После деаллокации (продолжить - [ENTER])");
+    getchar();
     return 0;
 }
