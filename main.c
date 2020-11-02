@@ -10,12 +10,10 @@
 #include <stdatomic.h>
 #include <linux/futex.h>
 #include <syscall.h>
-#include <asm/errno.h>
-#include <errno.h>
 
 #define print_thread_activity 0
 #define megabyte_size 1024*1024
-#define A 120
+#define A 300
 #define D 73
 #define E 150
 #define G 136
@@ -54,47 +52,23 @@ futex(int *uaddr, int futex_op, int val,
     return syscall(SYS_futex, uaddr, futex_op, val,
                    timeout, uaddr2, val3);
 }
-
-/* Acquire the futex pointed to by 'futexp': wait for its value to
-          become 1, and then set the value to 0. */
 static void
 fwait(int *futexp)
 {
-    int s;
-
-    /* atomic_compare_exchange_strong(ptr, oldval, newval)
-       atomically performs the equivalent of:
-
-           if (*ptr == *oldval)
-               *ptr = newval;
-
-       It returns true if the test yielded true and *ptr was updated. */
-
     while (1) {
-
-        /* Is the futex available? */
         const int one = 1;
         if (atomic_compare_exchange_strong(futexp, &one, 0))
-            break;      /* Yes */
-
-        /* Futex is not available; wait */
-
-        s = futex(futexp, FUTEX_WAIT, 0, NULL, NULL, 0);
-        if (s == -1 && errno != EAGAIN)
-            printf("futex-FUTEX_WAIT");
+            break;
+        futex(futexp, FUTEX_WAIT, 0, NULL, NULL, 0);
     }
 }
 
 static void
 fpost(int *futexp)
 {
-    int s;
-
     const int zero = 0;
     if (atomic_compare_exchange_strong(futexp, &zero, 1)) {
-        s = futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
-        if (s  == -1)
-            printf("futex-FUTEX_WAKE");
+        futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
     }
 }
 
@@ -107,9 +81,9 @@ int read_int_from_file(FILE *file) {
 }
 
 char* seq_read(int fd, int file_size) {
-    char *buffer = (char*) malloc(file_size);
-    int blocks = file_size / G;
-    int last_block_size = file_size % G;
+    const char *buffer = (char*) malloc(file_size);
+    const int blocks = file_size / G;
+    const int last_block_size = file_size % G;
     char* buf_ptr;
     for (int i = 0; i < blocks; ++i) {
         buf_ptr = buffer + G*i;
@@ -163,6 +137,10 @@ void *read_files(void *thread_data) {
                 printf("[READER-%d] wait for mutex %d...\n", data->thread_number, data->file_number);
             }
             fwait(&data->futexes[data->file_number]);
+            if (break_loop) {
+                fpost(&data->futexes[data->file_number]);
+                return NULL;
+            }
             if (observe_block) {
                 printf("[READER-%d] captured mutex %d!\n", data->thread_number, data->file_number);
             }
@@ -189,7 +167,7 @@ void *read_files(void *thread_data) {
         }
         int *int_buf = (int *) buffer;
         long sum = 0;
-        for (int i = 0; i < file_size / 4; i++) {
+        for (int i = 0; i < file_size / sizeof(int); i++) {
             sum += int_buf[i];
         }
 
@@ -205,7 +183,7 @@ void *read_files(void *thread_data) {
     return NULL;
 }
 
-void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
+void seq_write(void *ptr, int size, int n, int fd, const char* filepath, int file_offset) {
     struct stat fstat;
     stat(filepath, &fstat);
     int blksize = (int) fstat.st_blksize;
@@ -215,7 +193,6 @@ void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
     int blocks = bytes / blksize;
 
     char *buff = (char *) malloc((int)blksize+align);
-    // code from stackoverflow... wtf???
     char *wbuff = (char *)(((uintptr_t)buff+align)&~((uintptr_t)align));
 
     for (int i = 0; i < blocks; ++i) {
@@ -224,13 +201,13 @@ void seq_write(void *ptr, int size, int n, int fd, const char* filepath) {
         for (int j = 0; j < blksize; j++) {
             buff[j] = buf_ptr[j];
         }
-        if (pwrite(fd, wbuff, blksize, blksize*i) < 0) {
-            free((char *)buff);
+        if (pwrite(fd, wbuff, blksize, blksize*i + file_offset) < 0) {
+            free(buff);
             printf("write error occurred\n");
             return;
         }
     }
-    free((char *)buff);
+    free(buff);
 }
 
 void *write_to_files(void *thread_data) {
@@ -262,16 +239,18 @@ void *write_to_files(void *thread_data) {
             if (print_thread_activity) {
                 printf("[WRITER] write started\n");
             }
+            int file_offset = 0;
             while (!is_done) {
                 if (ints_to_file + write_pointer < data->end) {
-                    seq_write(write_pointer, sizeof(int), ints_to_file, current_file, filename);
+                    seq_write(write_pointer, sizeof(int), ints_to_file, current_file, filename, file_offset);
                     write_pointer += ints_to_file;
                     is_done = 1;
                 } else {
                     int available = data->end - write_pointer;
-                    seq_write(write_pointer, sizeof(int), available, current_file, filename);
+                    seq_write(write_pointer, sizeof(int), available, current_file, filename, file_offset);
                     write_pointer = data->start;
                     ints_to_file -= available;
+                    file_offset += available * 4;
                 }
             }
             close(current_file);
@@ -296,7 +275,7 @@ int main() {
 
     printf("До аллокации (продолжить - [ENTER])");
     getchar();
-    int *memory_region = malloc(A * megabyte_size);
+    const int *memory_region = malloc(A * megabyte_size);
     int *thread_data_start = memory_region;
 
     // generator threads start
@@ -358,18 +337,25 @@ int main() {
 
     // reader threads end
 
+    pthread_attr_t attr;
+    struct sched_param param;
+    pthread_attr_init (&attr);
+    pthread_attr_getschedparam (&attr, &param);
+    param.sched_priority += 0;
+    pthread_attr_setschedparam (&attr, &param);
+
     for (int i = 0; i < D; ++i) {
         pthread_create(&(generator_threads[i]), NULL, fill_with_random, &generator_data[i]);
     }
-
     pthread_create(thread_writer, NULL, write_to_files, writer_data);
-
     for (int i = 0; i < I; ++i) {
         pthread_create(&(reader_threads[i]), NULL, read_files, &reader_data[i]);
     }
+
     printf("Для останвки беск. цикла нажмите [ENTER]\n");
     getchar();
     break_loop = 1;
+
     for (int i = 0; i < I; i++) {
         pthread_join(reader_threads[i], NULL);
     }
@@ -389,7 +375,7 @@ int main() {
     free(reader_threads);
     free(reader_data);
     free(memory_region);
-    printf("После деаллокации (продолжить - [ENTER])");
+    printf("После деаллокации");
     getchar();
     return 0;
 }
